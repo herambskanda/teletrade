@@ -10,7 +10,12 @@ class Settings(BaseSettings):
     
     # Telegram Configuration
     telegram_bot_token: str
-    telegram_channels: List[str]
+    telegram_channels: str = "1577126140"
+    
+    @property
+    def telegram_channels_list(self) -> List[str]:
+        """Parse Telegram channels from comma-separated string."""
+        return [channel.strip() for channel in self.telegram_channels.split(",")]
     
     # Zerodha Kite Configuration
     kite_api_key: str
@@ -20,7 +25,12 @@ class Settings(BaseSettings):
     
     # OpenRouter Configuration
     openrouter_api_key: str
-    openrouter_models: List[str] = ["anthropic/claude-3-haiku", "meta-llama/llama-3.1-8b-instruct"]
+    openrouter_models: str = "anthropic/claude-3-haiku,meta-llama/llama-3.1-8b-instruct"
+    
+    @property
+    def openrouter_models_list(self) -> List[str]:
+        """Parse OpenRouter models from comma-separated string."""
+        return [model.strip() for model in self.openrouter_models.split(",")]
     
     # Database Configuration
     database_url: str = "postgresql://trading_user:trading_password123@localhost:5432/trading_bot"

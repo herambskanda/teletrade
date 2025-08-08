@@ -36,8 +36,36 @@ class TransactionType(Enum):
 class Product(Enum):
     """Kite product types."""
     CNC = "CNC"  # Cash and Carry for equity
-    MIS = "MIS"  # Intraday
+    MIS = "MIS"  # Margin Intraday Square off
     NRML = "NRML"  # Normal for F&O
+    CO = "CO"  # Cover Order
+    BO = "BO"  # Bracket Order
+
+
+class Variety(Enum):
+    """Order variety types."""
+    REGULAR = "regular"
+    AMO = "amo"  # After Market Order
+    CO = "co"  # Cover Order
+    BO = "bo"  # Bracket Order
+    ICEBERG = "iceberg"  # Iceberg Order
+
+
+class Validity(Enum):
+    """Order validity types."""
+    DAY = "DAY"
+    IOC = "IOC"  # Immediate or Cancel
+    TTL = "TTL"  # Time to Live
+
+
+class Exchange(Enum):
+    """Supported exchanges."""
+    NSE = "NSE"
+    BSE = "BSE"
+    NFO = "NFO"  # NSE F&O
+    CDS = "CDS"  # Currency
+    BFO = "BFO"  # BSE F&O
+    MCX = "MCX"  # Commodity
 
 
 class ZerodhaTrader:
@@ -53,10 +81,13 @@ class ZerodhaTrader:
         self.ticker_thread = None
         self.subscribed_tokens = []
         self.price_data = {}
+        self.instruments_cache = {}
+        self.last_instruments_update = None
         
         if self.access_token:
             self.kite.set_access_token(self.access_token)
             self.is_connected = True
+            self._validate_connection()
     
     def generate_session(self, request_token: str) -> str:
         """Generate access token from request token."""
@@ -68,6 +99,7 @@ class ZerodhaTrader:
             self.access_token = data["access_token"]
             self.kite.set_access_token(self.access_token)
             self.is_connected = True
+            self._validate_connection()
             
             logger.info("Zerodha session generated successfully")
             return self.access_token
@@ -76,9 +108,95 @@ class ZerodhaTrader:
             logger.error(f"Failed to generate session: {e}")
             raise
     
+    def _validate_connection(self):
+        """Validate Kite connection."""
+        try:
+            profile = self.kite.profile()
+            logger.info(f"Connected to Kite as {profile['user_name']} ({profile['user_id']})")
+        except Exception as e:
+            logger.error(f"Failed to validate Kite connection: {e}")
+            self.is_connected = False
+    
     def get_login_url(self) -> str:
         """Get the login URL for Kite Connect."""
         return self.kite.login_url()
+    
+    def get_instruments(self, exchange: str = "NSE", refresh: bool = False) -> List[Dict[str, Any]]:
+        """Get list of instruments for an exchange.
+        
+        Args:
+            exchange: Exchange (NSE, BSE, NFO, CDS, MCX)
+            refresh: Force refresh of cached instruments
+        """
+        try:
+            if not self.is_connected:
+                logger.error("Not connected to Kite")
+                return []
+            
+            # Check cache
+            cache_key = f"{exchange}_instruments"
+            if not refresh and cache_key in self.instruments_cache:
+                # Cache for 1 hour
+                if self.last_instruments_update and \
+                   (datetime.now() - self.last_instruments_update).seconds < 3600:
+                    return self.instruments_cache[cache_key]
+            
+            # Fetch fresh instruments
+            instruments = self.kite.instruments(exchange)
+            self.instruments_cache[cache_key] = instruments
+            self.last_instruments_update = datetime.now()
+            
+            logger.info(f"Fetched {len(instruments)} instruments for {exchange}")
+            return instruments
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch instruments: {e}")
+            return []
+    
+    def search_instrument(self, symbol: str, exchange: str = "NSE") -> Optional[Dict[str, Any]]:
+        """Search for an instrument by symbol.
+        
+        Args:
+            symbol: Trading symbol to search
+            exchange: Exchange to search in
+            
+        Returns:
+            Instrument dict with token, symbol, name etc.
+        """
+        try:
+            instruments = self.get_instruments(exchange)
+            
+            for inst in instruments:
+                if inst['tradingsymbol'] == symbol:
+                    return inst
+            
+            # Try partial match
+            for inst in instruments:
+                if symbol in inst['tradingsymbol']:
+                    logger.info(f"Found partial match: {inst['tradingsymbol']} for {symbol}")
+                    return inst
+            
+            logger.warning(f"Instrument {symbol} not found in {exchange}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to search instrument: {e}")
+            return None
+    
+    def get_instrument_token(self, symbol: str, exchange: str = "NSE") -> Optional[int]:
+        """Get instrument token for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange
+            
+        Returns:
+            Instrument token (integer) or None
+        """
+        instrument = self.search_instrument(symbol, exchange)
+        if instrument:
+            return instrument['instrument_token']
+        return None
     
     async def place_order(
         self,
@@ -91,6 +209,7 @@ class ZerodhaTrader:
         product: str = Product.CNC.value,
         exchange: str = "NSE",
         validity: str = "DAY",
+        variety: str = "regular",
         tag: str = "trading_bot"
     ) -> Optional[str]:
         """Place an order on Kite."""
@@ -109,7 +228,7 @@ class ZerodhaTrader:
                 logger.warning("Live trading is disabled")
                 return None
             
-            # Place actual order
+            # Place actual order using Kite Connect API
             order_params = {
                 "tradingsymbol": symbol,
                 "exchange": exchange,
@@ -118,6 +237,7 @@ class ZerodhaTrader:
                 "order_type": order_type,
                 "product": product,
                 "validity": validity,
+                "variety": variety,
                 "tag": tag
             }
             
@@ -128,7 +248,11 @@ class ZerodhaTrader:
             if order_type in [OrderType.SL.value, OrderType.SL_M.value]:
                 order_params["trigger_price"] = trigger_price
             
-            order_id = self.kite.place_order(**order_params)
+            # Remove variety from order_params since it's passed separately
+            order_params_copy = order_params.copy()
+            order_params_copy.pop('variety', None)
+            
+            order_id = self.kite.place_order(variety=variety, **order_params_copy)
             
             logger.info(f"Order placed successfully: {order_id} for {symbol}")
             return str(order_id)
@@ -270,27 +394,117 @@ class ZerodhaTrader:
     
     def get_historical_data(
         self,
-        instrument_token: str,
+        instrument_token: int,
         from_date: date,
         to_date: date,
-        interval: str = "day"
+        interval: str = "day",
+        continuous: bool = False,
+        oi: bool = False
     ) -> pd.DataFrame:
-        """Get historical data for backtesting."""
+        """Get historical data for backtesting.
+        
+        Args:
+            instrument_token: Instrument token (integer)
+            from_date: Start date  
+            to_date: End date
+            interval: minute, day, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute
+            continuous: Get continuous data for expired F&O contracts
+            oi: Include open interest data
+        """
         try:
             if not self.is_connected:
+                logger.error("Not connected to Kite")
                 return pd.DataFrame()
             
+            if self.settings.enable_paper_trading:
+                logger.info(f"Paper trading: Simulating historical data for token {instrument_token}")
+                # Return simulated data for paper trading
+                dates = pd.date_range(start=from_date, end=to_date, freq='D')
+                simulated_data = []
+                base_price = 100.0
+                
+                for d in dates:
+                    open_price = base_price + (hash(str(d)) % 10 - 5)
+                    high = open_price + abs(hash(str(d) + 'h') % 5)
+                    low = open_price - abs(hash(str(d) + 'l') % 5)
+                    close = (high + low) / 2
+                    
+                    simulated_data.append({
+                        'date': d,
+                        'open': open_price,
+                        'high': high,
+                        'low': low,
+                        'close': close,
+                        'volume': hash(str(d) + 'v') % 1000000
+                    })
+                    base_price = close
+                
+                return pd.DataFrame(simulated_data)
+            
+            # Fetch real historical data using Kite Connect API
+            # API expects format: GET /instruments/historical/:instrument_token/:interval
+            # with from, to, continuous, oi as query params
+            params = {
+                "from_date": from_date,
+                "to_date": to_date,
+                "interval": interval
+            }
+            
+            if continuous:
+                params["continuous"] = 1
+            if oi:
+                params["oi"] = 1
+                
             data = self.kite.historical_data(
                 instrument_token=instrument_token,
-                from_date=from_date,
-                to_date=to_date,
-                interval=interval
+                **params
             )
             
-            return pd.DataFrame(data)
+            if data:
+                df = pd.DataFrame(data)
+                logger.info(f"Fetched {len(df)} records of historical data for token {instrument_token}")
+                
+                # Ensure datetime column is properly formatted
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    
+                return df
+            
+            return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"Failed to fetch historical data: {e}")
+            return pd.DataFrame()
+    
+    def get_historical_data_by_symbol(
+        self,
+        symbol: str,
+        from_date: date,
+        to_date: date,
+        interval: str = "day",
+        exchange: str = "NSE"
+    ) -> pd.DataFrame:
+        """Get historical data for a symbol.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'RELIANCE', 'INFY')
+            from_date: Start date
+            to_date: End date
+            interval: minute, day, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute
+            exchange: Exchange (NSE, BSE, NFO, etc.)
+        """
+        try:
+            # Get instrument token for the symbol
+            token = self.get_instrument_token(symbol, exchange)
+            if not token:
+                logger.error(f"Could not find instrument token for {symbol} on {exchange}")
+                return pd.DataFrame()
+            
+            # Fetch historical data using token
+            return self.get_historical_data(token, from_date, to_date, interval)
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch historical data for {symbol}: {e}")
             return pd.DataFrame()
     
     def start_price_streaming(self, tokens: List[int]):
@@ -333,27 +547,56 @@ class ZerodhaTrader:
             logger.error(f"Failed to stop price streaming: {e}")
     
     def _on_ticks(self, ws, ticks):
-        """Handle incoming price ticks."""
+        """Handle incoming price ticks.
+        
+        Tick structure includes:
+        - instrument_token: Instrument identifier
+        - last_price: Last traded price
+        - ohlc: Open, high, low, close data
+        - volume: Volume traded
+        - buy_quantity, sell_quantity: Pending buy/sell quantity
+        - last_trade_time: Time of last trade
+        - oi: Open interest (for F&O)
+        - depth: Market depth (bid/ask)
+        """
         for tick in ticks:
             self.price_data[tick["instrument_token"]] = tick
-            logger.debug(f"Tick: {tick['instrument_token']} - {tick.get('last_price')}")
+            logger.debug(f"Tick: {tick['instrument_token']} - LTP: {tick.get('last_price')}, Volume: {tick.get('volume')}")
     
     def _on_connect(self, ws, response):
-        """Handle WebSocket connection."""
-        logger.info("WebSocket connected")
+        """Handle WebSocket connection.
+        
+        Once connected, subscribe to required tokens and set data mode:
+        - MODE_LTP: Last traded price only
+        - MODE_QUOTE: Market depth data  
+        - MODE_FULL: Complete market data including OHLC
+        """
+        logger.info(f"WebSocket connected: {response}")
         
         # Subscribe to tokens
         if self.subscribed_tokens:
             ws.subscribe(self.subscribed_tokens)
+            # Set to FULL mode for complete data
             ws.set_mode(ws.MODE_FULL, self.subscribed_tokens)
+            logger.info(f"Subscribed to {len(self.subscribed_tokens)} tokens in FULL mode")
     
     def _on_close(self, ws, code, reason):
         """Handle WebSocket close."""
         logger.info(f"WebSocket closed: {code} - {reason}")
+        self.price_data.clear()
     
     def _on_error(self, ws, code, reason):
         """Handle WebSocket error."""
         logger.error(f"WebSocket error: {code} - {reason}")
+    
+    def _on_order_update(self, ws, data):
+        """Handle order update via WebSocket postback."""
+        logger.info(f"Order update received: {data}")
+        # Process order update
+        if 'order_id' in data:
+            order_id = data['order_id']
+            status = data.get('status')
+            logger.info(f"Order {order_id} status: {status}")
     
     async def execute_signal(self, signal: Dict[str, Any]) -> Optional[str]:
         """Execute a trading signal."""
@@ -399,7 +642,22 @@ class ZerodhaTrader:
         available_cash = margins.get("equity", {}).get("available", {}).get("cash", 0)
         
         # Estimate required margin (simplified)
-        estimated_margin = signal.get("quantity", 0) * signal.get("entry_price", 0)
+        quantity = signal.get("quantity", 1)
+        
+        # If entry_price is not provided, get current price
+        entry_price = signal.get("entry_price")
+        if not entry_price:
+            # Get current market price
+            quotes = self.get_quote([signal["symbol"]], signal.get("exchange", "NSE"))
+            if quotes:
+                quote_key = f"{signal.get('exchange', 'NSE')}:{signal['symbol']}"
+                entry_price = quotes.get(quote_key, {}).get("last_price", 0)
+            
+            if not entry_price:
+                # Assume a default price for paper trading
+                entry_price = 1000.0 if self.settings.enable_paper_trading else 0
+        
+        estimated_margin = quantity * entry_price
         
         return available_cash >= estimated_margin
     
@@ -425,8 +683,16 @@ class ZerodhaTrader:
         """Store trade in database."""
         try:
             async with get_db_session() as session:
+                # Handle signal_id - convert to int if string numeric, otherwise use None
+                signal_id = signal.get("signal_id")
+                if signal_id and isinstance(signal_id, str):
+                    try:
+                        signal_id = int(signal_id) if signal_id.isdigit() else None
+                    except:
+                        signal_id = None
+                        
                 trade = Trade(
-                    signal_id=signal.get("signal_id"),
+                    signal_id=signal_id,
                     order_id=order_id,
                     symbol=signal["symbol"],
                     instrument_type=InstrumentType[signal.get("instrument_type", "EQUITY")],
@@ -440,6 +706,7 @@ class ZerodhaTrader:
                 )
                 session.add(trade)
                 await session.commit()
+                logger.info(f"Trade stored in database: {order_id}")
                 
         except Exception as e:
             logger.error(f"Failed to store trade: {e}")

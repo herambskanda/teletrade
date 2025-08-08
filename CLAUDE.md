@@ -37,6 +37,10 @@ createdb trading_bot
 - Set `ENABLE_LIVE_TRADING=true` only after thorough testing
 - Required APIs: Telegram Bot, Zerodha Kite Connect, OpenRouter, PostgreSQL, Redis
 
+## Development Best Practices
+
+- Use venv to run python commands
+
 ## Architecture Overview
 
 ### Core Processing Pipeline

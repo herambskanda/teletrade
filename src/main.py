@@ -12,15 +12,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Add src to Python path
-sys.path.append(str(Path(__file__).parent))
+# Add project root to Python path
+sys.path.append(str(Path(__file__).parent.parent))
 
 from config.settings import get_settings
-from database.connection import init_database_sync
-from telegram.collector import TelegramCollector
-from ai.parser import AISignalParser
-from trading.zerodha_client import ZerodhaTrader
-from risk.risk_manager import RiskManager
+from src.database.connection import init_database_sync
+from src.telegram.collector import TelegramCollector
+from src.ai.parser import AISignalParser
+from src.trading.zerodha_client import ZerodhaTrader
+from src.risk.risk_manager import RiskManager
 
 # Configure logging
 logging.basicConfig(
@@ -257,23 +257,110 @@ async def get_portfolio():
 
 
 @app.get("/signals/recent")
-async def get_recent_signals():
-    """Get recent signals."""
+async def get_recent_signals(limit: int = 50):
+    """Get recent signals from database."""
     try:
-        # This would typically fetch from database
-        # For now, return mock data
-        return {
-            "signals": [
-                {
-                    "timestamp": "2024-01-15T10:30:00",
-                    "symbol": "RELIANCE",
-                    "signal_type": "BUY",
-                    "confidence": 0.85,
-                    "status": "executed"
-                }
-            ]
-        }
+        from src.database.connection import get_db_session
+        from src.database.models import RawMessage
+        from sqlalchemy import select, desc
+        
+        async with get_db_session() as session:
+            # Get recent raw messages
+            result = await session.execute(
+                select(RawMessage)
+                .order_by(desc(RawMessage.message_date))
+                .limit(limit)
+            )
+            messages = result.scalars().all()
+            
+            # Convert to API format
+            signals = []
+            for msg in messages:
+                signals.append({
+                    "id": msg.id,
+                    "channel_id": msg.channel_id,
+                    "message_id": msg.message_id,
+                    "timestamp": msg.message_date.isoformat(),
+                    "text": msg.message_text,
+                    "sender_info": msg.sender_info,
+                    "processed": msg.processed
+                })
+            
+            return {"signals": signals}
+            
     except Exception as e:
+        logger.error(f"Error fetching recent signals: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/telegram/messages/historical")
+async def get_historical_messages(channel_id: str = None, days_back: int = 7, limit: int = 100):
+    """Fetch historical messages from Telegram channels."""
+    try:
+        collector = app_state["telegram_collector"]
+        
+        if channel_id:
+            # Fetch from specific channel
+            messages = await collector.fetch_historical_messages(
+                channel_id=channel_id,
+                limit=limit,
+                days_back=days_back
+            )
+        else:
+            # Fetch from all channels
+            messages = []
+            for cid in collector.channels:
+                channel_messages = await collector.fetch_historical_messages(
+                    channel_id=cid,
+                    limit=limit // len(collector.channels),
+                    days_back=days_back
+                )
+                messages.extend(channel_messages)
+        
+        return {
+            "messages": messages,
+            "count": len(messages),
+            "channels": collector.channels
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching historical messages: {e}")
+        return {"error": str(e)}
+
+
+@app.post("/telegram/messages/backfill")
+async def backfill_historical_messages(days_back: int = 7):
+    """Backfill historical messages and store in database."""
+    try:
+        collector = app_state["telegram_collector"]
+        
+        # Run backfill process
+        await collector.backfill_historical_messages(days_back=days_back)
+        
+        return {
+            "success": True,
+            "message": f"Backfill completed for last {days_back} days"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during backfill: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/telegram/channels/info")
+async def get_channel_info():
+    """Get information about monitored Telegram channels."""
+    try:
+        collector = app_state["telegram_collector"]
+        channel_info = await collector.get_channel_info()
+        
+        return {
+            "channels": channel_info,
+            "count": len(channel_info)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching channel info: {e}")
         return {"error": str(e)}
 
 

@@ -187,7 +187,7 @@ class PerformanceMetric(Base):
     metric_name = Column(String(100), nullable=False)
     metric_value = Column(Float)
     metric_date = Column(Date, nullable=False)
-    metadata = Column(JSON)
+    metric_metadata = Column(JSON)  # Renamed from 'metadata' to avoid SQLAlchemy conflict
     created_at = Column(DateTime, default=func.now())
 
 

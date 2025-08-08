@@ -6,12 +6,12 @@ import sys
 import os
 from pathlib import Path
 
-# Add src directory to Python path
-src_path = Path(__file__).parent.parent / "src"
-sys.path.append(str(src_path))
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.append(str(project_root))
 
 # Import dashboard pages
-from pages import dashboard, positions, signals, backtest, settings
+from pages import dashboard, positions, signals, backtest, settings, ai_agent
 
 # Configure Streamlit page
 st.set_page_config(
@@ -107,6 +107,7 @@ def main():
             "Select Page",
             [
                 "📊 Dashboard",
+                "🤖 AI Agent",
                 "📈 Positions",
                 "🎯 Signals",
                 "📋 Backtest",
@@ -127,12 +128,15 @@ def main():
         st.subheader("System Info")
         st.text("📡 Telegram: Connected")
         st.text("🔗 Zerodha: Connected")
+        st.text("🤖 AI Agent: Active")
         st.text("🧠 AI Models: Active")
         st.text("💾 Database: Healthy")
         
     # Main content area
     if page == "📊 Dashboard":
         dashboard.show()
+    elif page == "🤖 AI Agent":
+        ai_agent.show()
     elif page == "📈 Positions":
         positions.show()
     elif page == "🎯 Signals":

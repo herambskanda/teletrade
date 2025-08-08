@@ -1,21 +1,15 @@
-"""Telegram message collector for monitoring multiple channels."""
+"""Telegram message collector using Telethon API for full channel access."""
 
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
+from pathlib import Path
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    CallbackContext
-)
-from telegram.error import TelegramError
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.tl.types import Channel, Chat, User
 import redis.asyncio as redis
 
 from config.settings import get_settings
@@ -27,16 +21,23 @@ settings = get_settings()
 
 
 class TelegramCollector:
-    """Multi-channel Telegram message collector with real-time processing."""
+    """Telethon-based Telegram message collector with full API access."""
     
     def __init__(self):
         """Initialize the Telegram collector."""
         self.settings = settings
         self.redis_client: Optional[redis.Redis] = None
-        self.application: Optional[Application] = None
-        self.channels: List[str] = self.settings.telegram_channels
+        self.client: Optional[TelegramClient] = None
+        self.channels: List[str] = self.settings.telegram_channels_list
+        self.channel_entities: Dict[str, Any] = {}
         self.message_queue = asyncio.Queue()
         self.is_running = False
+        
+        # Telethon API credentials (from your working setup)
+        self.api_id = 26179321
+        self.api_hash = 'f63dd545353b8b8308d6e17f756fecca'
+        self.phone_number = '+917692020359'
+        self.session_file = 'trading_session'
         
     async def initialize(self):
         """Initialize connections and setup handlers."""
@@ -48,15 +49,30 @@ class TelegramCollector:
                 decode_responses=True
             )
             
-            # Initialize Telegram bot application
-            self.application = (
-                Application.builder()
-                .token(self.settings.telegram_bot_token)
-                .build()
+            # Initialize Telethon client with existing session
+            self.client = TelegramClient(
+                self.session_file, 
+                self.api_id, 
+                self.api_hash
             )
             
-            # Add handlers
-            self._setup_handlers()
+            # Connect to Telegram
+            await self.client.connect()
+            
+            # Check if we're authorized (should be from previous session)
+            if not await self.client.is_user_authorized():
+                logger.error("Telegram session expired - need to re-authenticate")
+                raise Exception("Telegram session expired. Run interactive_telegram_test.py to re-authenticate.")
+            
+            # Get user info
+            me = await self.client.get_me()
+            logger.info(f"Connected to Telegram as: {me.first_name} {me.last_name or ''} (@{me.username})")
+            
+            # Resolve channel entities
+            await self._resolve_channel_entities()
+            
+            # Set up event handlers for real-time messages
+            self._setup_event_handlers()
             
             logger.info("Telegram collector initialized successfully")
             
@@ -64,94 +80,104 @@ class TelegramCollector:
             logger.error(f"Failed to initialize Telegram collector: {e}")
             raise
     
-    def _setup_handlers(self):
-        """Set up message handlers for the bot."""
-        # Command handlers
-        self.application.add_handler(
-            CommandHandler("start", self.start_command)
-        )
-        self.application.add_handler(
-            CommandHandler("status", self.status_command)
-        )
-        self.application.add_handler(
-            CommandHandler("stop", self.stop_command)
-        )
-        
-        # Message handler for channel messages
-        self.application.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self.handle_channel_message
-            )
-        )
-        
-        # Error handler
-        self.application.add_error_handler(self.error_handler)
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /start command."""
-        await update.message.reply_text(
-            "Trading Bot Message Collector is active!\n"
-            f"Monitoring {len(self.channels)} channels.\n"
-            "Use /status to check current status."
-        )
-    
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /status command."""
-        status_msg = f"Bot Status: {'Running' if self.is_running else 'Stopped'}\n"
-        status_msg += f"Channels monitored: {len(self.channels)}\n"
-        
-        # Get queue size from Redis
-        if self.redis_client:
-            queue_size = await self.redis_client.llen("message_queue")
-            status_msg += f"Messages in queue: {queue_size}\n"
-        
-        await update.message.reply_text(status_msg)
-    
-    async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /stop command."""
-        self.is_running = False
-        await update.message.reply_text("Bot stopping...")
-    
-    async def handle_channel_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle messages from monitored channels."""
+    async def _resolve_channel_entities(self):
+        """Resolve channel IDs to entities."""
         try:
-            if not update.message or not update.message.text:
-                return
+            dialogs = await self.client.get_dialogs()
             
-            # Check if message is from a monitored channel
-            chat_id = str(update.effective_chat.id)
-            if chat_id not in self.channels:
-                logger.debug(f"Ignoring message from non-monitored channel: {chat_id}")
-                return
+            for channel_id in self.channels:
+                try:
+                    # Try to convert channel_id to int if it's a string
+                    if isinstance(channel_id, str):
+                        channel_id = int(channel_id)
+                    
+                    # Find the entity by ID
+                    entity = None
+                    for dialog in dialogs:
+                        if dialog.entity.id == channel_id:
+                            entity = dialog.entity
+                            break
+                    
+                    if entity:
+                        self.channel_entities[str(channel_id)] = entity
+                        logger.info(f"Resolved channel: {getattr(entity, 'title', 'Unknown')} (ID: {channel_id})")
+                    else:
+                        logger.warning(f"Could not find channel with ID: {channel_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error resolving channel {channel_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error resolving channel entities: {e}")
+    
+    def _setup_event_handlers(self):
+        """Set up event handlers for real-time messages."""
+        @self.client.on(events.NewMessage)
+        async def handle_new_message(event):
+            try:
+                # Check if message is from monitored channels
+                chat_id = str(event.chat_id)
+                if chat_id not in self.channels:
+                    return
+                
+                # Extract message data
+                message_data = await self._extract_message_data(event.message)
+                if message_data:
+                    # Store in database
+                    await self._store_message(message_data)
+                    
+                    # Queue for processing
+                    await self._queue_message(message_data)
+                    
+                    logger.info(f"Real-time message collected from channel {chat_id}: {event.message.id}")
+                    
+            except Exception as e:
+                logger.error(f"Error handling new message: {e}")
+    
+    async def _extract_message_data(self, message) -> Optional[Dict[str, Any]]:
+        """Extract structured data from a Telegram message."""
+        try:
+            # Skip messages without text
+            if not message.text:
+                return None
             
-            # Create message data
-            message_data = {
-                "channel_id": chat_id,
-                "message_id": str(update.message.message_id),
-                "message_text": update.message.text,
-                "message_date": update.message.date.isoformat(),
-                "sender_info": {
-                    "user_id": update.message.from_user.id if update.message.from_user else None,
-                    "username": update.message.from_user.username if update.message.from_user else None,
-                    "first_name": update.message.from_user.first_name if update.message.from_user else None,
-                },
-                "chat_info": {
-                    "title": update.effective_chat.title,
-                    "type": update.effective_chat.type,
+            # Get sender info
+            sender_info = {}
+            if message.sender:
+                sender_info = {
+                    "user_id": message.sender.id,
+                    "username": getattr(message.sender, 'username', None),
+                    "first_name": getattr(message.sender, 'first_name', None),
+                    "last_name": getattr(message.sender, 'last_name', None),
+                }
+            
+            # Get chat info
+            chat_info = {}
+            if message.chat:
+                chat_info = {
+                    "title": getattr(message.chat, 'title', None),
+                    "type": type(message.chat).__name__,
+                }
+            
+            return {
+                "channel_id": str(message.chat_id),
+                "message_id": str(message.id),
+                "message_text": message.text,
+                "message_date": message.date.isoformat(),
+                "sender_info": sender_info,
+                "chat_info": chat_info,
+                "raw_message": {
+                    "id": message.id,
+                    "date": message.date.isoformat(),
+                    "text": message.text,
+                    "sender_id": message.sender_id,
+                    "chat_id": message.chat_id,
                 }
             }
             
-            # Store in database
-            await self._store_message(message_data)
-            
-            # Queue for processing
-            await self._queue_message(message_data)
-            
-            logger.info(f"Message collected from channel {chat_id}: {update.message.message_id}")
-            
         except Exception as e:
-            logger.error(f"Error handling channel message: {e}")
+            logger.error(f"Error extracting message data: {e}")
+            return None
     
     async def _store_message(self, message_data: Dict[str, Any]):
         """Store message in database."""
@@ -178,7 +204,7 @@ class TelegramCollector:
                 # Add to Redis queue
                 await self.redis_client.lpush(
                     "message_queue",
-                    json.dumps(message_data)
+                    json.dumps(message_data, default=str)
                 )
                 
                 # Also add to in-memory queue
@@ -189,19 +215,88 @@ class TelegramCollector:
         except Exception as e:
             logger.error(f"Failed to queue message: {e}")
     
-    async def error_handler(self, update: Update, context: CallbackContext):
-        """Handle errors in the bot."""
-        logger.error(f"Update {update} caused error {context.error}")
-        
-        # Try to notify admin
+    async def fetch_historical_messages(self, channel_id: str, limit: int = 1000, days_back: int = 30) -> List[Dict[str, Any]]:
+        """Fetch historical messages from a channel."""
         try:
-            if self.settings.alert_telegram_chat_id:
-                await context.bot.send_message(
-                    chat_id=self.settings.alert_telegram_chat_id,
-                    text=f"Error in bot: {context.error}"
-                )
-        except:
-            pass
+            entity = self.channel_entities.get(channel_id)
+            if not entity:
+                logger.error(f"Channel entity not found for ID: {channel_id}")
+                return []
+            
+            # Calculate the date to fetch from
+            offset_date = datetime.now() - timedelta(days=days_back)
+            
+            logger.info(f"Fetching {limit} historical messages from {getattr(entity, 'title', channel_id)} since {offset_date.date()}")
+            
+            messages = []
+            async for message in self.client.iter_messages(
+                entity, 
+                limit=limit,
+                offset_date=offset_date
+            ):
+                message_data = await self._extract_message_data(message)
+                if message_data:
+                    messages.append(message_data)
+            
+            logger.info(f"Fetched {len(messages)} historical messages from channel {channel_id}")
+            return messages
+            
+        except FloodWaitError as e:
+            logger.warning(f"Rate limited, waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching historical messages from channel {channel_id}: {e}")
+            return []
+    
+    async def backfill_historical_messages(self, days_back: int = 30, batch_size: int = 100):
+        """Backfill historical messages for all channels."""
+        logger.info(f"Starting historical message backfill for {days_back} days")
+        
+        for channel_id in self.channels:
+            try:
+                # Check what's the latest message we have in database
+                async with get_db_session() as session:
+                    from sqlalchemy import select, desc
+                    result = await session.execute(
+                        select(RawMessage.message_date)
+                        .where(RawMessage.channel_id == channel_id)
+                        .order_by(desc(RawMessage.message_date))
+                        .limit(1)
+                    )
+                    latest_date = result.scalar_one_or_none()
+                
+                if latest_date:
+                    logger.info(f"Latest message in DB for channel {channel_id}: {latest_date}")
+                    # Fetch messages since the latest we have
+                    since_date = latest_date
+                else:
+                    # Fetch messages from specified days back
+                    since_date = datetime.now() - timedelta(days=days_back)
+                    
+                logger.info(f"Fetching messages since {since_date} for channel {channel_id}")
+                
+                # Fetch historical messages
+                messages = await self.fetch_historical_messages(channel_id, limit=1000, days_back=days_back)
+                
+                # Store in batches
+                stored_count = 0
+                for i in range(0, len(messages), batch_size):
+                    batch = messages[i:i + batch_size]
+                    for message_data in batch:
+                        try:
+                            await self._store_message(message_data)
+                            stored_count += 1
+                        except Exception as e:
+                            logger.error(f"Error storing message {message_data['message_id']}: {e}")
+                    
+                    # Small delay between batches
+                    await asyncio.sleep(1)
+                
+                logger.info(f"Stored {stored_count} historical messages for channel {channel_id}")
+                
+            except Exception as e:
+                logger.error(f"Error backfilling channel {channel_id}: {e}")
     
     async def start_monitoring(self):
         """Start monitoring Telegram channels."""
@@ -210,21 +305,18 @@ class TelegramCollector:
             logger.info("Starting Telegram monitoring...")
             
             # Initialize if not already done
-            if not self.application:
+            if not self.client:
                 await self.initialize()
             
-            # Start polling
-            await self.application.initialize()
-            await self.application.start()
-            await self.application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES
-            )
+            # Perform initial backfill
+            logger.info("Performing historical message backfill...")
+            await self.backfill_historical_messages(days_back=7)  # Last 7 days
             
-            logger.info(f"Monitoring {len(self.channels)} channels")
+            # Start real-time monitoring
+            logger.info(f"Starting real-time monitoring of {len(self.channels)} channels")
             
-            # Keep running
-            while self.is_running:
-                await asyncio.sleep(1)
+            # Keep the client running for real-time events
+            await self.client.run_until_disconnected()
             
         except Exception as e:
             logger.error(f"Error in monitoring: {e}")
@@ -238,10 +330,8 @@ class TelegramCollector:
         try:
             self.is_running = False
             
-            if self.application:
-                await self.application.updater.stop()
-                await self.application.stop()
-                await self.application.shutdown()
+            if self.client:
+                await self.client.disconnect()
             
             if self.redis_client:
                 await self.redis_client.close()
@@ -262,6 +352,36 @@ class TelegramCollector:
                     messages.append(json.loads(message_json))
         
         return messages
+
+    async def get_channel_info(self) -> Dict[str, Dict[str, Any]]:
+        """Get information about monitored channels."""
+        channel_info = {}
+        
+        for channel_id, entity in self.channel_entities.items():
+            try:
+                # Get basic info
+                info = {
+                    "id": entity.id,
+                    "title": getattr(entity, 'title', 'Unknown'),
+                    "type": type(entity).__name__,
+                    "username": getattr(entity, 'username', None),
+                }
+                
+                # Get participant count if available
+                try:
+                    full_entity = await self.client.get_entity(entity)
+                    if hasattr(full_entity, 'participants_count'):
+                        info["participants_count"] = full_entity.participants_count
+                except:
+                    pass
+                
+                channel_info[channel_id] = info
+                
+            except Exception as e:
+                logger.error(f"Error getting info for channel {channel_id}: {e}")
+                channel_info[channel_id] = {"error": str(e)}
+        
+        return channel_info
 
 
 async def main():
